@@ -1,17 +1,10 @@
+#!/usr/bin/env python3
 """
-PubMed fetcher (public data only)
+Fetch PubMed abstracts using NCBI E-utilities (Biopython Entrez)
+and save as JSONL for downstream embedding/indexing.
 
-- Search PubMed with a query
-- Fetch abstracts for returned PMIDs
-- Save as JSONL for downstream indexing
-
-Usage (later, from terminal):
-  python scripts/pubmed_fetch.py --query "gamma delta T cell CD16" --max 50 --out data/pubmed.jsonl
-
-NCBI policy: set your email (required by Entrez).
-  export NCBI_EMAIL="you@example.com"
-Optional:
-  export NCBI_API_KEY="..."
+Usage example:
+  python scripts/pubmed_fetch.py --query "gamma delta T cells CD16" --max_results 200 --out data/pubmed.jsonl
 """
 
 from __future__ import annotations
@@ -20,158 +13,161 @@ import argparse
 import json
 import os
 import time
-from dataclasses import dataclass, asdict
-from typing import Iterable, List, Optional
+from typing import Dict, Any, List
 
 from Bio import Entrez
+from Bio.Entrez import HTTPError
 from tqdm import tqdm
 
 
-@dataclass
-class PubMedRecord:
-    pmid: str
-    title: str
-    journal: str
-    year: str
-    authors: List[str]
-    abstract: str
-    url: str
+def _configure_entrez(email: str | None, api_key: str | None) -> None:
+    Entrez.email = email or os.getenv("NCBI_EMAIL") or "example@example.com"
+    # NOTE: NCBI requests an email. Use your real email via env var NCBI_EMAIL.
+    key = api_key or os.getenv("NCBI_API_KEY")
+    if key:
+        Entrez.api_key = key
 
 
-def _configure_entrez() -> None:
-    email = os.getenv("NCBI_EMAIL")
-    if not email:
-        raise RuntimeError(
-            "NCBI_EMAIL is not set. Please set it, e.g.\n"
-            '  export NCBI_EMAIL="you@example.com"\n'
-            "(Entrez requires an email address.)"
-        )
-    Entrez.email = email
-    api_key = os.getenv("NCBI_API_KEY")
-    if api_key:
-        Entrez.api_key = api_key
-
-
-def search_pmids(query: str, max_results: int = 100) -> List[str]:
-    """Return a list of PMIDs for the given PubMed query."""
-    _configure_entrez()
+def esearch_pmids(query: str, max_results: int) -> List[str]:
     handle = Entrez.esearch(
         db="pubmed",
         term=query,
         retmax=max_results,
         sort="relevance",
     )
-    results = Entrez.read(handle)
+    res = Entrez.read(handle)
     handle.close()
-    return list(results.get("IdList", []))
+    return list(res.get("IdList", []))
 
 
-def fetch_details(pmids: Iterable[str], sleep_sec: float = 0.34) -> List[PubMedRecord]:
-    """
-    Fetch article details/abstracts for PMIDs using efetch (XML).
-    sleep_sec: be polite to NCBI; with API key you can go faster.
-    """
-    _configure_entrez()
-    pmid_list = list(pmids)
-    if not pmid_list:
-        return []
+def efetch_details(pmids: List[str], batch_size: int = 100) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
 
-    records: List[PubMedRecord] = []
-
-    # Fetch in chunks (NCBI-friendly)
-    chunk_size = 50
-    for i in range(0, len(pmid_list), chunk_size):
-        chunk = pmid_list[i : i + chunk_size]
-        handle = Entrez.efetch(db="pubmed", id=",".join(chunk), retmode="xml")
-        data = Entrez.read(handle)
-        handle.close()
+    for i in range(0, len(pmids), batch_size):
+        batch = pmids[i : i + batch_size]
+        # efetch in XML
+        tries = 0
+        while True:
+            try:
+                handle = Entrez.efetch(
+                    db="pubmed",
+                    id=",".join(batch),
+                    rettype="abstract",
+                    retmode="xml",
+                )
+                data = Entrez.read(handle)
+                handle.close()
+                break
+            except HTTPError as e:
+                tries += 1
+                if tries >= 5:
+                    raise e
+                time.sleep(1.5 * tries)
 
         articles = data.get("PubmedArticle", [])
         for art in articles:
-            medline = art.get("MedlineCitation", {})
-            article = medline.get("Article", {})
+            try:
+                medline = art["MedlineCitation"]
+                article = medline["Article"]
 
-            pmid = str(medline.get("PMID", ""))
+                pmid = str(medline["PMID"])
+                title = str(article.get("ArticleTitle", "")).strip()
 
-            title = " ".join(str(article.get("ArticleTitle", "")).split())
-            journal = ""
-            year = ""
+                # Abstract can be list of sections
+                abstract_text = ""
+                if "Abstract" in article and "AbstractText" in article["Abstract"]:
+                    abs_parts = article["Abstract"]["AbstractText"]
+                    # abs_parts elements can be strings or dict-like
+                    joined = []
+                    for p in abs_parts:
+                        joined.append(str(p))
+                    abstract_text = "\n".join(joined).strip()
 
-            journal_info = article.get("Journal", {})
-            journal = str(journal_info.get("Title", "") or "")
+                journal = ""
+                if "Journal" in article and "Title" in article["Journal"]:
+                    journal = str(article["Journal"]["Title"]).strip()
 
-            # Year
-            journal_issue = journal_info.get("JournalIssue", {})
-            pub_date = journal_issue.get("PubDate", {})
-            year = str(pub_date.get("Year", "") or "")
+                year = ""
+                if "Journal" in article and "JournalIssue" in article["Journal"]:
+                    ji = article["Journal"]["JournalIssue"]
+                    if "PubDate" in ji:
+                        pd = ji["PubDate"]
+                        year = str(pd.get("Year", pd.get("MedlineDate", ""))).strip()
 
-            # Authors
-            authors = []
-            for a in article.get("AuthorList", []) or []:
-                last = a.get("LastName")
-                fore = a.get("ForeName")
-                if last and fore:
-                    authors.append(f"{fore} {last}")
-                elif last:
-                    authors.append(str(last))
+                # DOI (optional)
+                doi = ""
+                if "ELocationID" in article:
+                    for el in article["ELocationID"]:
+                        try:
+                            if el.attributes.get("EIdType") == "doi":
+                                doi = str(el).strip()
+                                break
+                        except Exception:
+                            pass
 
-            # Abstract (may have multiple sections)
-            abstract_text = ""
-            abstract = article.get("Abstract")
-            if abstract and "AbstractText" in abstract:
-                parts = abstract.get("AbstractText", [])
-                # parts can contain strings or dict-like with labels
-                texts = []
-                for p in parts:
-                    texts.append(str(p))
-                abstract_text = "\n".join(t.strip() for t in texts if t.strip())
+                url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
 
-            url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""
-
-            # Keep only useful records (must have abstract)
-            if pmid and abstract_text:
                 records.append(
-                    PubMedRecord(
-                        pmid=pmid,
-                        title=title,
-                        journal=journal,
-                        year=year,
-                        authors=authors,
-                        abstract=abstract_text,
-                        url=url,
-                    )
+                    {
+                        "pmid": pmid,
+                        "title": title,
+                        "abstract": abstract_text,
+                        "journal": journal,
+                        "year": year,
+                        "doi": doi,
+                        "url": url,
+                        "query_source": None,
+                    }
                 )
+            except Exception:
+                # skip malformed entries but continue
+                continue
 
-        time.sleep(sleep_sec)
+        # polite rate limit
+        time.sleep(0.34)
 
     return records
-
-
-def save_jsonl(records: List[PubMedRecord], out_path: str) -> None:
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(asdict(r), ensure_ascii=False) + "\n")
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--query", required=True, help="PubMed query string")
-    p.add_argument("--max", type=int, default=50, help="Max number of PMIDs to fetch")
+    p.add_argument("--max_results", type=int, default=200, help="Max number of PMIDs to fetch")
     p.add_argument("--out", default="data/pubmed.jsonl", help="Output JSONL path")
+    p.add_argument("--email", default=None, help="NCBI email (or set env NCBI_EMAIL)")
+    p.add_argument("--api_key", default=None, help="NCBI API key (or set env NCBI_API_KEY)")
+    p.add_argument("--batch_size", type=int, default=100, help="efetch batch size")
     args = p.parse_args()
 
-    pmids = search_pmids(args.query, max_results=args.max)
+    _configure_entrez(args.email, args.api_key)
+
+    pmids = esearch_pmids(args.query, args.max_results)
     if not pmids:
-        print("No PMIDs found.")
+        print("No PMIDs found. Try a different query.")
         return
 
-    recs = []
-    for r in tqdm(fetch_details(pmids), desc="Fetching abstracts"):
-        recs.append(r)
+    print(f"Found {len(pmids)} PMIDs. Fetching details...")
+    # show progress by chunk count
+    all_records: List[Dict[str, Any]] = []
+    for i in tqdm(range(0, len(pmids), args.batch_size)):
+        batch = pmids[i : i + args.batch_size]
+        recs = efetch_details(batch, batch_size=len(batch))
+        for r in recs:
+            r["query_source"] = args.query
+        all_records.extend(recs)
 
-    save_jsonl(recs, args.out)
-    print(f"Saved {len(recs)} records to {args.out}")
+    # Ensure output dir exists (local run)
+    out_dir = os.path.dirname(args.out)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    with open(args.out, "w", encoding="utf-8") as f:
+        for r in all_records:
+            # keep only docs that have at least title or abstract
+            if (r.get("title") or "").strip() or (r.get("abstract") or "").strip():
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    print(f"Saved {len(all_records)} records to: {args.out}")
 
 
 if __name__ == "__main__":
