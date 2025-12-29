@@ -1,0 +1,9 @@
+requests>=2.31.0
+biopython>=1.83
+sentence-transformers>=2.7.0
+faiss-cpu>=1.8.0
+numpy>=1.26.0
+pandas>=2.2.0
+tqdm>=4.66.0
+python-dotenv>=1.0.1
+rich>=13.7.0
