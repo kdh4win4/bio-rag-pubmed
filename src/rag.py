@@ -119,3 +119,8 @@ class BioRAG:
         chunks: List[str] = []
         for i, p in enumerate(papers, start=1):
             header = f"[{i}] PMID:{p.pmid} | {p.year or ''} {p.journal or ''}".strip()
+            title = p.title.strip()
+            abstract = p.abstract.strip()
+            url = f"URL: {p.url}" if p.url else ""
+            chunks.append("\n".join(x for x in [header, title, abstract, url] if x))
+        return "\n\n---\n\n".join(chunks)
