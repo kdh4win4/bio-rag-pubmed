@@ -49,7 +49,7 @@ class BioRAG:
 
     @staticmethod
     def load(
-        index_path: reminder := str | Path,
+        index_path: str | Path,
         meta_path: str | Path,
         embed_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         normalize: bool = True,
