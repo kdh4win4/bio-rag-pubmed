@@ -2,154 +2,231 @@
 """
 Fetch PubMed records (title/abstract/metadata) into JSONL.
 
-Key behavior:
-- By default, forces PubMed search to return ONLY records that have abstracts,
-  using 'hasabstract[text]' at the search stage.
-- Also filters again at save stage (if abstract missing -> skip).
+Default behavior:
+- Fetches up to --max_results PMIDs for --query, then downloads details in batches.
+- Writes JSONL to --out.
 
-Output JSONL fields:
-  pmid, title, abstract, journal, pub_year, url
+Options:
+- --require_abstract: keep only records with a non-empty abstract
+- --min_abstract_chars: minimum abstract length (after joining parts)
+- --allow_no_abstract: (legacy) allow missing abstracts (default: True unless --require_abstract)
+
+Notes:
+- Uses NCBI E-utilities (Entrez). You should set --email to something valid.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
+import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Dict, Any, List, Optional
 
 import requests
-from xml.etree import ElementTree as ET
+from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
-def _request(url: str, params: Dict[str, Any], retries: int = 5, backoff: float = 1.5) -> requests.Response:
-    last_err = None
-    for i in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last_err = e
-            time.sleep((backoff ** i) + 0.2)
-    raise RuntimeError(f"Request failed after {retries} retries: {url} params={params} err={last_err}")
+USER_AGENT = "bio-rag-pubmed/1.0 (requests; python)"
 
-def _esearch(query: str, retmax: int, email: str = "", tool: str = "bio-rag-pubmed") -> List[str]:
-    url = f"{EUTILS_BASE}/esearch.fcgi"
+
+def _clean_ws(s: str) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return s
+
+
+def _esearch_pmids(query: str, retmax: int) -> List[str]:
     params = {
         "db": "pubmed",
         "term": query,
         "retmode": "json",
-        "retmax": retmax,
-        "tool": tool,
+        "retmax": str(retmax),
     }
-    if email:
-        params["email"] = email
-
-    r = _request(url, params)
+    r = requests.get(ESEARCH_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=60)
+    r.raise_for_status()
     data = r.json()
-    return data.get("esearchresult", {}).get("idlist", []) or []
+    return data.get("esearchresult", {}).get("idlist", [])
+
 
 def _chunks(lst: List[str], n: int) -> List[List[str]]:
-    return [lst[i:i+n] for i in range(0, len(lst), n)]
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
 
-def _safe_text(el: Optional[ET.Element]) -> str:
+
+def _extract_text(el) -> str:
     if el is None:
         return ""
-    # join text of element and all subelements
-    return "".join(el.itertext()).strip()
+    return _clean_ws(el.get_text(" ", strip=True))
 
-def _parse_pubmed_xml(xml_text: str) -> List[Dict[str, Any]]:
-    root = ET.fromstring(xml_text)
-    out: List[Dict[str, Any]] = []
 
-    for art in root.findall(".//PubmedArticle"):
-        pmid = _safe_text(art.find(".//MedlineCitation/PMID"))
-        title = _safe_text(art.find(".//Article/ArticleTitle"))
+def _parse_pub_year(article) -> str:
+    # Try ArticleDate year, then JournalIssue PubDate year
+    year = ""
+    ad = article.find("ArticleDate")
+    if ad and ad.find("Year"):
+        year = _extract_text(ad.find("Year"))
+    if not year:
+        pubdate = article.find("JournalIssue")
+        if pubdate:
+            pd = pubdate.find("PubDate")
+            if pd and pd.find("Year"):
+                year = _extract_text(pd.find("Year"))
+    return year
 
-        # Abstract can be multiple <AbstractText> blocks
-        abs_texts = []
-        for at in art.findall(".//Article/Abstract/AbstractText"):
-            t = _safe_text(at)
-            if t:
-                abs_texts.append(t)
-        abstract = "\n".join(abs_texts).strip()
 
-        journal = _safe_text(art.find(".//Article/Journal/Title"))
+def _parse_abstract(article) -> str:
+    """
+    PubMed XML often has:
+      <Abstract><AbstractText>...</AbstractText></Abstract>
+    Sometimes multiple AbstractText nodes (with labels).
+    """
+    abs_el = article.find("Abstract")
+    if not abs_el:
+        return ""
 
-        # Year: try PubDate/Year first, fallback to MedlineDate (extract first 4 digits)
-        year = _safe_text(art.find(".//Article/Journal/JournalIssue/PubDate/Year"))
-        if not year:
-            medline_date = _safe_text(art.find(".//Article/Journal/JournalIssue/PubDate/MedlineDate"))
-            if medline_date:
-                # crude: take first 4-digit chunk
-                for token in medline_date.replace("-", " ").split():
-                    if len(token) == 4 and token.isdigit():
-                        year = token
-                        break
+    parts = []
+    for at in abs_el.find_all("AbstractText"):
+        txt = _extract_text(at)
+        if not txt:
+            continue
+        label = at.get("Label") or at.get("NlmCategory") or ""
+        label = _clean_ws(label)
+        if label and label.lower() not in ("unspecified",):
+            parts.append(f"{label}: {txt}")
+        else:
+            parts.append(txt)
 
-        url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""
+    abstract = "\n".join(parts).strip()
+    return abstract
 
-        out.append(
-            {
-                "pmid": pmid,
-                "title": title,
-                "abstract": abstract,
-                "journal": journal,
-                "pub_year": year,
-                "url": url,
-            }
-        )
-    return out
 
-def _efetch(pmids: List[str], email: str = "", tool: str = "bio-rag-pubmed") -> List[Dict[str, Any]]:
-    url = f"{EUTILS_BASE}/efetch.fcgi"
+def _efetch_details(pmids: List[str], email: str) -> List[Dict[str, Any]]:
     params = {
         "db": "pubmed",
         "id": ",".join(pmids),
         "retmode": "xml",
-        "tool": tool,
     }
     if email:
         params["email"] = email
 
-    r = _request(url, params)
-    return _parse_pubmed_xml(r.text)
+    r = requests.get(EFETCH_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=60)
+    r.raise_for_status()
 
-def main() -> None:
+    soup = BeautifulSoup(r.text, "lxml-xml")
+    out: List[Dict[str, Any]] = []
+
+    for article in soup.find_all("PubmedArticle"):
+        medline = article.find("MedlineCitation")
+        if not medline:
+            continue
+
+        pmid = _extract_text(medline.find("PMID"))
+        art = medline.find("Article")
+        if not art:
+            continue
+
+        title = _extract_text(art.find("ArticleTitle"))
+        abstract = _parse_abstract(art)
+
+        journal = ""
+        j = art.find("Journal")
+        if j and j.find("Title"):
+            journal = _extract_text(j.find("Title"))
+
+        pub_year = _parse_pub_year(art)
+
+        rec: Dict[str, Any] = {
+            "pmid": pmid,
+            "title": title,
+            "abstract": abstract,
+            "journal": journal,
+            "pub_year": pub_year,
+            "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
+        }
+        out.append(rec)
+
+    return out
+
+
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--query", required=True, help="PubMed query term (without hasabstract filter)")
-    ap.add_argument("--max_results", type=int, default=100)
-    ap.add_argument("--out", default="data/pubmed.jsonl")
-    ap.add_argument("--batch_size", type=int, default=100, help="PMIDs per efetch batch")
-    ap.add_argument("--email", default="", help="NCBI recommends an email for E-utilities")
-    ap.add_argument("--allow_no_abstract", action="store_true", help="If set, do NOT filter by abstract")
+    ap.add_argument("--query", required=True, help="PubMed query")
+    ap.add_argument("--max_results", type=int, default=50, help="Max number of PMIDs to fetch")
+    ap.add_argument("--out", default="data/pubmed.jsonl", help="Output JSONL path")
+    ap.add_argument("--batch_size", type=int, default=200, help="EFetch batch size (PMIDs per request)")
+    ap.add_argument("--email", default="", help="NCBI recommended: your email")
+    ap.add_argument(
+        "--allow_no_abstract",
+        action="store_true",
+        help="(legacy) Allow records missing abstracts (default behavior unless --require_abstract).",
+    )
+    ap.add_argument(
+        "--require_abstract",
+        action="store_true",
+        help="Keep only records with non-empty abstracts.",
+    )
+    ap.add_argument(
+        "--min_abstract_chars",
+        type=int,
+        default=0,
+        help="Minimum abstract length (after joining parts). 0 = no minimum.",
+    )
     args = ap.parse_args()
 
-    # Force hasabstract at search stage unless user explicitly allows no-abstract
-    term = args.query.strip()
-    if not args.allow_no_abstract:
-        term = f"({term}) AND hasabstract[text]"
+    pmids = _esearch_pmids(args.query, args.max_results)
+    if not pmids:
+        print("No PMIDs found.", file=sys.stderr)
+        sys.exit(1)
 
-    pmids = _esearch(term, retmax=args.max_results, email=args.email)
     print(f"Found {len(pmids)} PMIDs. Fetching details...")
 
-    kept = 0
-    with open(args.out, "w", encoding="utf-8") as f:
-        for chunk in tqdm(_chunks(pmids, args.batch_size)):
-            recs = _efetch(chunk, email=args.email)
-            for rec in recs:
-                # final guard: skip empty abstract unless allow_no_abstract
-                if (not args.allow_no_abstract) and (not (rec.get("abstract") or "").strip()):
-                    continue
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                kept += 1
+    records: List[Dict[str, Any]] = []
+    for chunk in tqdm(list(_chunks(pmids, args.batch_size))):
+        recs = _efetch_details(chunk, args.email)
+        records.extend(recs)
+        time.sleep(0.34)  # be polite
 
-    print(f"Saved {kept} records to: {args.out}")
-    if not args.allow_no_abstract and kept < len(pmids):
-        print(f"Note: skipped {len(pmids) - kept} records without abstracts.")
+    # Filtering logic
+    require_abs = args.require_abstract
+    if require_abs:
+        filtered = []
+        for r in records:
+            abs_txt = (r.get("abstract") or "").strip()
+            if not abs_txt:
+                continue
+            if args.min_abstract_chars and len(abs_txt) < args.min_abstract_chars:
+                continue
+            filtered.append(r)
+        records = filtered
+    else:
+        # Default/legacy:
+        # If user did NOT request require_abstract, we keep everything.
+        # (args.allow_no_abstract kept for backward compatibility; no-op here.)
+        if args.min_abstract_chars:
+            # if user sets min chars without require, apply it anyway (safe behavior)
+            records = [
+                r
+                for r in records
+                if (r.get("abstract") or "").strip()
+                and len((r.get("abstract") or "").strip()) >= args.min_abstract_chars
+            ]
+
+    # Write JSONL
+    with open(args.out, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    print(f"Saved {len(records)} records to: {args.out}")
+    if require_abs and len(records) == 0:
+        print(
+            "WARNING: After filtering, 0 records remained. Try a broader query or reduce --min_abstract_chars.",
+            file=sys.stderr,
+        )
+
 
 if __name__ == "__main__":
     main()
