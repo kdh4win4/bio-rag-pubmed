@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+.env.*
+*.env
+
+# Secrets / keys
+secrets.json
+config.yaml
+config.yml
+*.key
+
+# Data (if large / private)
+data/*.json
+data/*.pkl
+data/*.faiss
+data/*.npy
+
+# OS
+.DS_Store
